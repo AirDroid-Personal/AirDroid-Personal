@@ -1,0 +1,230 @@
+/*
+ * SPDX-FileCopyrightText: 2016 Aleix Pol Gonzalez <aleixpol@kde.org>
+ *
+ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+ */
+
+#include <QApplication>
+#include <QIcon>
+#include <QPointer>
+#include <QProcess>
+#include <QQuickStyle>
+#include <QThread>
+
+#ifdef Q_OS_WIN
+#include <Windows.h>
+#endif
+
+#ifdef Q_OS_WIN
+#include <QSystemTrayIcon>
+#else
+#include <KStatusNotifierItem>
+#endif
+
+#ifdef Q_OS_MACOS
+#include <QMessageBox>
+#endif
+
+#include <KAboutData>
+#include <KColorSchemeManager>
+#include <KCrash>
+#include <KDBusService>
+#include <KIconTheme>
+#include <KLocalizedString>
+
+#include "dbusinterfaces/dbusinterfaces.h"
+#include "deviceindicator.h"
+#include "kdeconnect-version.h"
+#include "models/devicesmodel.h"
+#include "models/devicessortproxymodel.h"
+
+#include <dbushelper.h>
+
+#include "indicatorhelper.h"
+#include "openconfig.h"
+
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+#include "desktop_daemon.h"
+#endif
+
+int main(int argc, char **argv)
+{
+#ifdef Q_OS_WIN
+    // If ran from a console, redirect the output there
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+    }
+#endif
+
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+    // Install KIconEngine so widget icons get recolored in dark mode. Must be called before QApplication.
+    KIconTheme::initTheme();
+    // Same as kdeconnectd: don't quit when a QEventLoopLocker used by the embedded daemon is released
+    QGuiApplication::setQuitLockEnabled(false);
+#endif
+    QApplication app(argc, argv);
+
+#ifdef Q_OS_MACOS
+    // On macOS there's nothing that autostarts the dbus daemon, we have to do it. Needs a QApplication.
+    int dbusStatus = DBusHelper::startDBusDaemon();
+    if (dbusStatus) {
+        QMessageBox::critical(nullptr,
+                              i18n("KDE Connect"),
+                              i18n("Cannot connect to DBus\n"
+                                   "KDE Connect will quit"),
+                              QMessageBox::Abort,
+                              QMessageBox::Abort);
+        return dbusStatus;
+    }
+#endif
+
+    IndicatorHelper helper;
+
+    KAboutData aboutData(QStringLiteral("kdeconnect-indicator"),
+                         i18n("KDE Connect Indicator"),
+                         QStringLiteral(KDECONNECT_VERSION_STRING),
+                         i18n("KDE Connect Indicator tool"),
+                         KAboutLicense::GPL,
+                         i18n("© 2016–2025 KDE Connect Team"));
+    aboutData.addAuthor(i18n("Aleix Pol Gonzalez"), {}, QStringLiteral("aleixpol@kde.org"));
+    aboutData.addAuthor(i18n("Albert Vaca Cintora"), {}, QStringLiteral("albertvaka@kde.org"));
+    aboutData.setProgramLogo(QIcon::fromTheme(QStringLiteral("kdeconnect")));
+    KAboutData::setApplicationData(aboutData);
+
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+    // Ensure we have a suitable color theme set for light/dark mode. KColorSchemeManager implicitly applies
+    // a suitable default theme.
+    KColorSchemeManager::instance();
+    // Force breeze style to ensure coloring works consistently in dark mode. Specifically tab colors have
+    // troubles on windows.
+    QApplication::setStyle(QStringLiteral("breeze"));
+    // Force breeze icon theme to ensure we can correctly adapt icons to color changes WRT dark/light mode.
+    // Without this we may end up with hicolor and fail to support icon recoloring.
+    QIcon::setThemeName(QStringLiteral("breeze"));
+#else
+    QIcon::setFallbackThemeName(QStringLiteral("breeze"));
+#endif
+
+    // Default to org.kde.desktop style unless the user forces another style
+    if (qEnvironmentVariableIsEmpty("QT_QUICK_CONTROLS_STYLE")) {
+        QQuickStyle::setStyle(QStringLiteral("org.kde.desktop"));
+    }
+
+    KCrash::initialize();
+
+    KDBusService dbusService(KDBusService::Unique);
+
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+    // On Windows and macOS the indicator is the main process, so the daemon runs in it instead of in kdeconnectd.
+    // This way the OS attributes everything the daemon does (eg: Now Playing, Local Network) to the app.
+    DesktopDaemon daemon;
+#endif
+
+    DevicesModel model;
+    model.setDisplayFilter(DevicesModel::Reachable | DevicesModel::Paired);
+    DevicesSortProxyModel proxyModel;
+    proxyModel.setSourceModel(&model);
+    QMenu *menu = new QMenu;
+
+    DaemonDbusInterface iface;
+
+    auto refreshMenu = [&iface, &proxyModel, &menu]() {
+        // Submenus are not owned by their actions, so clear() doesn't delete them
+        const auto actions = menu->actions();
+        for (QAction *action : actions) {
+            if (QMenu *subMenu = action->menu()) {
+                subMenu->deleteLater();
+            }
+        }
+        menu->clear();
+        // Note: This is needed on macOS since a single click on the icon doesn't open the app like on other platforms.
+        menu->addAction(i18n("Open app"), menu, []() {
+            OpenConfig oc;
+            oc.openConfiguration();
+        });
+        for (int i = 0, count = proxyModel.rowCount(); i < count; ++i) {
+            QObject *deviceObject = proxyModel.data(proxyModel.index(i, 0), DevicesModel::DeviceRole).value<QObject *>();
+            DeviceDbusInterface *device = qobject_cast<DeviceDbusInterface *>(deviceObject);
+            if (device == nullptr)
+                continue;
+
+            auto indicator = new DeviceIndicator(device);
+            QObject::connect(device, &DeviceDbusInterface::destroyed, indicator, &QObject::deleteLater);
+
+            menu->addMenu(indicator);
+        }
+        const QStringList requests = iface.pairingRequests();
+        if (!requests.isEmpty()) {
+            menu->addSection(i18n("Pairing requests"));
+
+            for (const auto &req : requests) {
+                DeviceDbusInterface *dev = new DeviceDbusInterface(req);
+                auto pairMenu = menu->addMenu(dev->name());
+                dev->setParent(pairMenu);
+                pairMenu->addAction(i18nc("Accept a pairing request", "Pair"), dev, &DeviceDbusInterface::acceptPairing);
+                pairMenu->addAction(i18n("Reject"), dev, &DeviceDbusInterface::cancelPairing);
+            }
+        }
+        // Add quit menu
+#if defined(Q_OS_MACOS)
+        menu->addAction(i18n("Quit"), qApp, []() {
+            const auto quitApplication = [](const QString &service) {
+                const auto message = QDBusMessage::createMethodCall(service,
+                                                                    QStringLiteral("/MainApplication"),
+                                                                    QStringLiteral("org.qtproject.Qt.QCoreApplication"),
+                                                                    QStringLiteral("quit"));
+                QDBusConnection::sessionBus().call(message, QDBus::NoBlock);
+            };
+            quitApplication(QStringLiteral("org.kde.kdeconnect.app"));
+            qApp->quit();
+        });
+#elif defined(Q_OS_WIN)
+        menu->addAction(QIcon::fromTheme(QStringLiteral("application-exit")), i18n("Quit"), qApp, &QApplication::quit);
+#endif
+    };
+
+    QObject::connect(&iface, &DaemonDbusInterface::pairingRequestsChanged, &model, refreshMenu);
+    QObject::connect(&model, &DevicesModel::rowsInserted, &model, refreshMenu);
+    QObject::connect(&model, &DevicesModel::rowsRemoved, &model, refreshMenu);
+
+#ifdef Q_OS_WIN
+    QSystemTrayIcon systray;
+    helper.systrayIconHook(systray);
+    systray.setVisible(true);
+    systray.setToolTip(QStringLiteral("KDE Connect"));
+    QObject::connect(&model, &DevicesModel::rowsChanged, &model, [&systray, &model]() {
+        systray.setToolTip(i18np("%1 device connected", "%1 devices connected", model.rowCount()));
+    });
+    QObject::connect(&systray, &QSystemTrayIcon::activated, &systray, [](QSystemTrayIcon::ActivationReason reason) {
+        if (reason == QSystemTrayIcon::Trigger) {
+            OpenConfig oc;
+            oc.openConfiguration();
+        }
+    });
+
+    systray.setContextMenu(menu);
+#else
+    KStatusNotifierItem systray;
+    helper.systrayIconHook(systray);
+    systray.setToolTip(QStringLiteral("kdeconnect"), QStringLiteral("KDE Connect"), QStringLiteral("KDE Connect"));
+    systray.setCategory(KStatusNotifierItem::Communications);
+    systray.setStatus(KStatusNotifierItem::Passive);
+    systray.setStandardActionsEnabled(false);
+    QObject::connect(&model, &DevicesModel::rowsChanged, &model, [&systray, &model]() {
+        const auto count = model.rowCount();
+#ifndef Q_OS_MACOS // On MacOS, setting status to Active disables color theme syncing of the menu icon
+        systray.setStatus(count == 0 ? KStatusNotifierItem::Passive : KStatusNotifierItem::Active);
+#endif
+        systray.setToolTip(QStringLiteral("kdeconnect"), QStringLiteral("KDE Connect"), i18np("%1 device connected", "%1 devices connected", count));
+    });
+
+    systray.setContextMenu(menu);
+#endif
+
+    refreshMenu();
+
+    app.setQuitOnLastWindowClosed(false);
+
+    return app.exec();
+}
